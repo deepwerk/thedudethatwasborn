@@ -131,16 +131,7 @@ class AlignAndOverlay:
 
         # Compute orientation and magnitude.  Orientation is mapped from
         # [−π, π] to [0°,360°).  np.arctan2 returns values in [−π, π].
-        # Convert the raw arctan2 angle from [−π,π] to degrees in [0,360).
-        # `np.arctan2` returns an angle in radians centred on the negative
-        # x‑axis.  The original implementation mistakenly shifted
-        # orientations by π (180°), which effectively rotated all
-        # orientations by half a circle.  The correct conversion is to
-        # multiply by 180/π to get degrees and then take the result mod
-        # 360 to wrap negative angles into the 0–360° range.  Without
-        # the modulo, angles near −180° would be incorrectly mapped
-        # near 180°.
-        angles = (np.arctan2(grad_y, grad_x) * (180.0 / math.pi)) % 360.0
+        angles = (np.arctan2(grad_y, grad_x) + math.pi) * (180.0 / math.pi)
         magnitudes = np.hypot(grad_x, grad_y)
 
         # Threshold the magnitudes to remove low‑contrast regions.  This
@@ -164,100 +155,6 @@ class AlignAndOverlay:
         else:
             hist = hist.astype(np.float64)
         return hist
-
-    @staticmethod
-    def _mask_orientation_angle(mask: np.ndarray) -> float:
-        """Compute the dominant orientation of a binary mask.
-
-        The orientation is derived from the principal component of the
-        coordinates of non‑zero pixels.  It returns an angle in
-        degrees within [0,180).  Because a shape and its 180° rotated
-        counterpart have identical second moments, the orientation is
-        inherently ambiguous by 180°; this function normalises the
-        angle into a half‑circle.
-
-        Parameters
-        ----------
-        mask: np.ndarray
-            A 2‑D boolean or integer array indicating the pixels of
-            interest.  True/1 values denote foreground.
-
-        Returns
-        -------
-        float
-            The orientation angle in degrees in the range [0,180).
-        """
-        ys, xs = np.where(mask)
-        if ys.size == 0:
-            return 0.0
-        # Stack x and y coordinates; centre them to compute covariance
-        coords = np.vstack((xs, ys))  # shape 2 × N
-        coords_centered = coords - coords.mean(axis=1, keepdims=True)
-        # Covariance matrix of coordinates
-        cov = coords_centered @ coords_centered.T / coords_centered.shape[1]
-        # Eigen decomposition; the largest eigenvalue corresponds to the
-        # major axis of the distribution
-        eigvals, eigvecs = np.linalg.eigh(cov)
-        idx = int(np.argmax(eigvals))
-        v = eigvecs[:, idx]
-        # Angle of the eigenvector; arctan2 returns angle in [−π,π]
-        angle = math.degrees(math.atan2(v[1], v[0]))
-        # Map into [0,180)
-        return angle % 180.0
-
-    def _estimate_rotation_pca(self, image_A: np.ndarray, image_B: np.ndarray) -> float:
-        """Estimate the rotation needed to align two images via PCA on masks.
-
-        This method computes the orientation of the non‑zero masks of
-        `image_A` and `image_B` using principal component analysis.
-        The difference between the two orientations yields a candidate
-        rotation.  Because the principal orientation is ambiguous up
-        to 180°, four candidate rotations are considered: the
-        positive and negative differences modulo 360°, and those
-        differences plus 180°.  Each candidate rotation is applied
-        (without reshaping) to `image_A` and the resulting mask is
-        compared to the mask of `image_B` using a simple XOR count.
-        The candidate yielding the smallest mask mismatch is selected.
-
-        Parameters
-        ----------
-        image_A: np.ndarray
-            Source image of shape `(H,W,C)`.
-        image_B: np.ndarray
-            Target image of shape `(H,W,C)`.
-
-        Returns
-        -------
-        float
-            Estimated rotation in degrees to apply to `image_A` to best
-            align it with `image_B`.
-        """
-        eps = 1e-8
-        mask_A = np.any(image_A > eps, axis=2)
-        mask_B = np.any(image_B > eps, axis=2)
-        # Orientation angles in [0,180)
-        ang_A = self._mask_orientation_angle(mask_A)
-        ang_B = self._mask_orientation_angle(mask_B)
-        # Nominal difference in [0,180)
-        diff = (ang_B - ang_A) % 180.0
-        # Generate four candidate angles in [0,360): diff, diff+180, -diff, -diff+180
-        c1 = diff
-        c2 = (diff + 180.0) % 360.0
-        c3 = (-diff) % 360.0
-        c4 = ((-diff) + 180.0) % 360.0
-        candidates = [c1, c2, c3, c4]
-        best_theta = 0.0
-        best_score = None
-        for cand in candidates:
-            # Rotate without reshape so that the mask sizes match B
-            rot = nd_rotate(image_A, angle=cand, reshape=False, order=1, mode="constant", cval=0.0)
-            mask_rot = np.any(rot > eps, axis=2)
-            # Score: count of differing pixels between masks
-            score = np.count_nonzero(mask_rot != mask_B)
-            if best_score is None or score < best_score:
-                best_score = score
-                best_theta = cand
-        return float(best_theta)
 
     def _find_best_rotation(self, hist_A: np.ndarray, hist_B: np.ndarray) -> float:
         """Find the rotation (in degrees) that aligns two orientation histograms.
@@ -417,12 +314,12 @@ class AlignAndOverlay:
             A_np = images_A[idx].cpu().detach().numpy().astype(np.float64)
             B_np = images_B[idx].cpu().detach().numpy().astype(np.float64)
 
-            # Estimate the rotation that best aligns A with B.  Rather than
-            # using gradient orientation histograms, we compute the
-            # orientation of the foreground masks via PCA and test
-            # candidate rotations.  This method is more robust for
-            # shapes with ambiguous gradient distributions.
-            theta = -self._estimate_rotation_pca(A_np, B_np)
+            # Compute the gradient orientation histograms for both images
+            hist_A = self._gradient_orientation_hist(A_np)
+            hist_B = self._gradient_orientation_hist(B_np)
+
+            # Estimate the rotation that best aligns A with B
+            theta = self._find_best_rotation(hist_A, hist_B)
 
             # Rotate image A by the estimated angle
             A_rot = self._rotate_image(A_np, theta)
