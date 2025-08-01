@@ -497,6 +497,8 @@ def _find_angle_auto_refine(
     grad_threshold: float,
     exponents: List[int] | Tuple[int, ...] = (0, 1, 2, 3, 4),
     window_bins: int = 3,
+    search_min_deg: float | None = None,
+    search_max_deg: float | None = None,
 ) -> float:
     """
     Determine the rotation angle needed to align the orientation histograms
@@ -527,6 +529,15 @@ def _find_angle_auto_refine(
         The rotation angle (in degrees) that best aligns ``img_a`` to
         ``img_b`` according to the orientation histograms.
     """
+    # Normalize search range
+    if search_min_deg is None or search_max_deg is None:
+        # Default to full 360° search
+        search_min_deg = 0.0
+        search_max_deg = 360.0
+    # Convert min and max to floats
+    search_min_deg = float(search_min_deg)
+    search_max_deg = float(search_max_deg)
+
     # Initialize best shift and previous exponent
     best_shift = 0
     prev_exp = exponents[0]
@@ -537,8 +548,36 @@ def _find_angle_auto_refine(
         hist_b = _gradient_histogram(img_b, mask_b, delta, grad_threshold)
         bins = len(hist_a)
         if idx == 0:
-            # At the coarsest level, search across all possible shifts
-            search_indices = range(bins)
+            # At the coarsest level, search across the user‑specified global range
+            # Convert degree range into histogram index range
+            # Normalize degrees into [0, 360)
+            # Because Python's mod on negatives returns positive remainder
+            min_deg = search_min_deg % 360.0
+            max_deg = search_max_deg % 360.0
+            if min_deg == max_deg:
+                # full circle
+                global_indices = list(range(bins))
+            elif min_deg < max_deg:
+                start_idx = int(math.floor(min_deg / delta))
+                end_idx = int(math.ceil(max_deg / delta))
+                # Clamp to [0, bins)
+                start_idx = max(0, start_idx)
+                end_idx = min(bins - 1, end_idx)
+                global_indices = list(range(start_idx, end_idx + 1))
+            else:
+                # Wrap‑around interval
+                start_idx1 = int(math.floor(min_deg / delta))
+                end_idx1 = bins - 1
+                start_idx2 = 0
+                end_idx2 = int(math.ceil(max_deg / delta))
+                # Clamp
+                start_idx1 = max(0, start_idx1)
+                end_idx1 = min(bins - 1, end_idx1)
+                start_idx2 = max(0, start_idx2)
+                end_idx2 = min(bins - 1, end_idx2)
+                global_indices = list(range(start_idx1, end_idx1 + 1)) + list(range(start_idx2, end_idx2 + 1))
+            # At the coarsest level, initial candidate shifts are exactly the global indices
+            search_indices = global_indices
         else:
             # Determine how many fine bins correspond to one coarse bin
             # Example: going from exp=0 (delta=1) to exp=1 (delta=0.1)
@@ -548,7 +587,31 @@ def _find_angle_auto_refine(
             # Build a list of candidate shifts within the search window
             # The search window width is scaled by factor
             offsets = range(-window_bins * factor, window_bins * factor + 1)
-            search_indices = [(center + off) % bins for off in offsets]
+            local_candidates = [(center + off) % bins for off in offsets]
+            # Compute the global search indices for this resolution
+            min_deg = search_min_deg % 360.0
+            max_deg = search_max_deg % 360.0
+            if min_deg == max_deg:
+                global_indices = list(range(bins))
+            elif min_deg < max_deg:
+                start_idx = int(math.floor(min_deg / delta))
+                end_idx = int(math.ceil(max_deg / delta))
+                start_idx = max(0, start_idx)
+                end_idx = min(bins - 1, end_idx)
+                global_indices = list(range(start_idx, end_idx + 1))
+            else:
+                start_idx1 = int(math.floor(min_deg / delta))
+                end_idx1 = bins - 1
+                start_idx2 = 0
+                end_idx2 = int(math.ceil(max_deg / delta))
+                start_idx1 = max(0, start_idx1)
+                end_idx1 = min(bins - 1, end_idx1)
+                start_idx2 = max(0, start_idx2)
+                end_idx2 = min(bins - 1, end_idx2)
+                global_indices = list(range(start_idx1, end_idx1 + 1)) + list(range(start_idx2, end_idx2 + 1))
+            global_set = set(global_indices)
+            # Intersection of local candidates with global search interval
+            search_indices = [c for c in local_candidates if c in global_set]
         # Find the best shift within the candidate indices
         min_err = None
         min_idx = 0
@@ -611,6 +674,31 @@ class AlignImagesAutoRefineNode:
                         "display": "slider",
                     },
                 ),
+                # Minimum angle (in degrees) for the global search interval.
+                # Values can be negative and wrap around 360.  For example,
+                # -20 means 340°.
+                "search_min_deg": (
+                    "FLOAT",
+                    {
+                        "default": -180.0,
+                        "min": -180.0,
+                        "max": 180.0,
+                        "step": 1.0,
+                    },
+                ),
+                # Maximum angle (in degrees) for the global search interval.
+                # If the maximum is less than the minimum, the interval wraps
+                # around 360°.  For example, min=350 and max=10 defines a
+                # search over [350°, 360°) ∪ [0°, 10°].
+                "search_max_deg": (
+                    "FLOAT",
+                    {
+                        "default": 180.0,
+                        "min": -180.0,
+                        "max": 180.0,
+                        "step": 1.0,
+                    },
+                ),
             }
         }
 
@@ -626,6 +714,8 @@ class AlignImagesAutoRefineNode:
         mask_b: "torch.Tensor",
         grad_threshold: float = 0.04,
         window_bins: int = 3,
+        search_min_deg: float = -180.0,
+        search_max_deg: float = 180.0,
     ) -> Tuple["torch.Tensor", "torch.Tensor", Any]:
         """
         Align a batch of images using the multi‑resolution angle search.
@@ -645,6 +735,13 @@ class AlignImagesAutoRefineNode:
         window_bins : int
             Number of coarse bins on either side of the current best shift
             to search when refining.  A value of 3 is usually sufficient.
+        search_min_deg : float
+            Minimum angle (in degrees) of the global search interval.  Values
+            outside the range [0, 360) wrap around.  If the minimum is
+            greater than the maximum, the search wraps across 0°.
+        search_max_deg : float
+            Maximum angle (in degrees) of the global search interval.  If
+            equal to the minimum, the search covers the full 360°.
 
         Returns
         -------
@@ -675,6 +772,8 @@ class AlignImagesAutoRefineNode:
                 grad_threshold=grad_threshold,
                 exponents=(0, 1, 2, 3, 4),
                 window_bins=window_bins,
+                search_min_deg=search_min_deg,
+                search_max_deg=search_max_deg,
             )
             # Compose and convert back to torch
             composed_np, out_msk_np = _rotate_and_compose(
