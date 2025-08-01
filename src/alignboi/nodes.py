@@ -68,19 +68,12 @@ class AlignAndOverlay:
 
     @classmethod
     def INPUT_TYPES(cls) -> Dict[str, Dict[str, Tuple[str, Dict[str, Any]]]]:
-        """Define the input types for the node.
-
-        Returns
-        -------
-        dict
-            A dictionary with a required key specifying two inputs of type
-            IMAGE.  Both inputs are required and should have the same
-            batch size and spatial dimensions.
-        """
+        """Define the input types for the node, including rotation matching mode selector."""
         return {
             "required": {
                 "images_A": ("IMAGE", {}),
                 "images_B": ("IMAGE", {}),
+                "rotation_mode": ("STRING", {"default": "pca", "choices": ["pca", "hog"]}),
             },
         }
 
@@ -378,7 +371,7 @@ class AlignAndOverlay:
         rotated = nd_rotate(image, angle=angle_deg, reshape=True, order=1, mode="constant", cval=0.0)
         return rotated
 
-    def align_overlay(self, images_A: torch.Tensor, images_B: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def align_overlay(self, images_A: torch.Tensor, images_B: torch.Tensor, rotation_mode: str = "pca") -> Tuple[torch.Tensor, torch.Tensor]:
         """Align and overlay a batch of images.
 
         Parameters
@@ -420,12 +413,15 @@ class AlignAndOverlay:
             A_np = images_A[idx].cpu().detach().numpy().astype(np.float64)
             B_np = images_B[idx].cpu().detach().numpy().astype(np.float64)
 
-            # Estimate the rotation that best aligns A with B.  Rather than
-            # using gradient orientation histograms, we compute the
-            # orientation of the foreground masks via PCA and test
-            # candidate rotations.  This method is more robust for
-            # shapes with ambiguous gradient distributions.
-            theta = -self._estimate_rotation_pca(A_np, B_np)
+            # Select rotation matching mode
+            if rotation_mode == "hog":
+                hist_A = self._gradient_orientation_hist(A_np)
+                hist_B = self._gradient_orientation_hist(B_np)
+                theta = self._find_best_rotation(hist_A, hist_B)  # No negation for HOG mode
+                # Uncomment for debugging:
+                # print(f"HOG rotation angle: {theta}")
+            else:
+                theta = -self._estimate_rotation_pca(A_np, B_np)
 
             # Rotate image A by the estimated angle
             A_rot = self._rotate_image(A_np, theta)
