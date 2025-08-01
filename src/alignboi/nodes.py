@@ -19,12 +19,14 @@ mask_a:  MASK      – Binary mask for the source image. Non‑zero pixels indic
 image_b: IMAGE     – The target image into which the rotated source will be placed.
 mask_b:  MASK      – Binary mask for the target image. Non‑zero pixels indicate the
                      area where the source image should be inserted.
-delta_h: FLOAT     – Bin size for the gradient direction histogram, in degrees.
-                     Smaller values yield finer resolution at the cost of speed.
+delta_h_exp: INT   – Exponent used to derive the histogram bin size.  The actual
+                     bin size ``delta_h`` is computed as ``10**(-delta_h_exp)``.
+                     Setting ``delta_h_exp`` to 0 yields a bin size of 1.0°,
+                     while a value of 4 yields 0.0001°.  This slider steps
+                     through discrete values [0,1,2,3,4].
 grad_threshold: FLOAT – Threshold on the relative gradient magnitude used to ignore
-                     weak edges when computing the histogram.  Values in the
-                     range [0, 1] are appropriate; the default (0.04) mimics
-                     the Pluto notebook.
+                     weak edges when computing the histogram.  Values are
+                     selected linearly between 0.04 and 0.10 in 0.01 steps.
 ```
 
 Outputs
@@ -321,6 +323,15 @@ class AlignImagesNode:
         """
         Define the input types for the node.  The keys of the returned
         dictionary correspond to argument names of the processing function.
+
+        The `delta_h_exp` slider controls the histogram bin size indirectly.
+        The actual bin size used is `10 ** (-delta_h_exp)`, allowing the
+        histogram resolution to vary across the range 1.0 → 0.0001.  The
+        exponent is constrained to integer values between 0 and 4 so the
+        resulting bin sizes are [1, 0.1, 0.01, 0.001, 0.0001].
+
+        The `grad_threshold` slider selects a relative gradient magnitude
+        threshold between 0.04 and 0.1 in steps of 0.01.
         """
         return {
             "required": {
@@ -328,24 +339,25 @@ class AlignImagesNode:
                 "mask_a": ("MASK",),
                 "image_b": ("IMAGE",),
                 "mask_b": ("MASK",),
-                # Histogram bin size in degrees
-                "delta_h": (
-                    "FLOAT",
+                # Exponent for the histogram bin size.  The actual delta used
+                # is 10**(-delta_h_exp), giving values from 1 down to 0.0001.
+                "delta_h_exp": (
+                    "INT",
                     {
-                        "default": 0.1,
-                        "min": 0.01,
-                        "max": 45.0,
-                        "step": 0.01,
+                        "default": 1,
+                        "min": 0,
+                        "max": 4,
+                        "step": 1,
                         "display": "slider",
                     },
                 ),
-                # Gradient magnitude threshold (relative)
+                # Gradient magnitude threshold (relative) between 0.04 and 0.1
                 "grad_threshold": (
                     "FLOAT",
                     {
                         "default": 0.04,
-                        "min": 0.0,
-                        "max": 1.0,
+                        "min": 0.04,
+                        "max": 0.1,
                         "step": 0.01,
                         "display": "slider",
                     },
@@ -365,7 +377,7 @@ class AlignImagesNode:
         mask_a: "torch.Tensor",
         image_b: "torch.Tensor",
         mask_b: "torch.Tensor",
-        delta_h: float = 0.1,
+        delta_h_exp: int = 1,
         grad_threshold: float = 0.04,
     ) -> Tuple["torch.Tensor", "torch.Tensor", Any]:
         """
@@ -375,17 +387,19 @@ class AlignImagesNode:
         Parameters
         ----------
         image_a : torch.Tensor
-            A batch of source images with shape [B, H, W, C] where C=3.
+            A batch of source images with shape ``[B, H, W, C]`` where ``C=3``.
         mask_a : torch.Tensor
-            A batch of source masks with shape [B, H, W].  Values should lie
-            in [0, 1].
+            A batch of source masks with shape ``[B, H, W]``.  Values should lie
+            in ``[0, 1]``.
         image_b : torch.Tensor
-            A batch of target images with shape [B, H, W, C].
+            A batch of target images with shape ``[B, H, W, C]``.
         mask_b : torch.Tensor
-            A batch of target masks with shape [B, H, W].
-        delta_h : float
-            Histogram bin size in degrees.  Must divide 360 such that the
-            number of bins is an integer.
+            A batch of target masks with shape ``[B, H, W]``.
+        delta_h_exp : int
+            Exponent used to derive the histogram bin size.  The actual bin
+            size ``delta_h`` is computed as ``10 ** (-delta_h_exp)``.  When
+            ``delta_h_exp = 0``, ``delta_h = 1.0``; when ``delta_h_exp = 4``,
+            ``delta_h = 0.0001``.
         grad_threshold : float
             Relative gradient magnitude threshold for histogram construction.
 
@@ -405,6 +419,12 @@ class AlignImagesNode:
                 "OpenCV is required for this custom node but was not imported."
             )
 
+        # The actual histogram bin size is 10 ** (-delta_h_exp)
+        # Constrain exponent to avoid invalid values
+        if delta_h_exp < 0:
+            delta_h_exp = 0
+        delta_h = 10.0 ** float(-delta_h_exp)
+
         # Ensure batch dimensions match
         B = image_a.shape[0]
         if (mask_a.shape[0] != B) or (image_b.shape[0] != B) or (mask_b.shape[0] != B):
@@ -422,7 +442,8 @@ class AlignImagesNode:
             img_b_np = image_b[idx].detach().cpu().numpy()
             mask_b_np = mask_b[idx].detach().cpu().numpy()
 
-            # Compute histograms for both images using their masks
+            # Compute histograms for both images using their masks.  The
+            # histogram bin size is derived from the exponent: delta_h = 10**(-exp)
             hist_a = _gradient_histogram(img_a_np, mask_a_np, delta_h, grad_threshold)
             hist_b = _gradient_histogram(img_b_np, mask_b_np, delta_h, grad_threshold)
             # Find the shift which best aligns B to A
