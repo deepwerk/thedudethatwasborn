@@ -476,3 +476,228 @@ NODE_CLASS_MAPPINGS: Dict[str, Any] = {
 NODE_DISPLAY_NAME_MAPPINGS: Dict[str, str] = {
     "AlignImagesNode": "Align Images (Pluto)",
 }
+
+##########################################################
+# Auto‑refining version of the alignment node
+#
+# This class implements a multi‑resolution search for the relative
+# rotation angle.  It starts with a coarse histogram bin size (1°)
+# and iteratively refines the bin size by a factor of ten until
+# it reaches a resolution of 0.0001°.  At each refinement step,
+# instead of evaluating every possible shift, it searches only
+# within a window around the best shift found at the previous
+# resolution.  This drastically reduces computation time while
+# still converging on a very precise angle.
+
+def _find_angle_auto_refine(
+    img_a: np.ndarray,
+    mask_a: np.ndarray,
+    img_b: np.ndarray,
+    mask_b: np.ndarray,
+    grad_threshold: float,
+    exponents: List[int] | Tuple[int, ...] = (0, 1, 2, 3, 4),
+    window_bins: int = 3,
+) -> float:
+    """
+    Determine the rotation angle needed to align the orientation histograms
+    of ``img_a`` and ``img_b`` using a progressive, multi‑resolution search.
+
+    Parameters
+    ----------
+    img_a, mask_a, img_b, mask_b : np.ndarray
+        Arrays representing the source/target images and masks.
+    grad_threshold : float
+        Relative gradient magnitude threshold for histogram construction.
+    exponents : sequence of int, optional
+        A sequence of histogram exponents to use.  Each exponent ``e``
+        corresponds to a bin size ``delta = 10**(-e)``.  The search
+        proceeds through each exponent in order.  The default
+        ``(0,1,2,3,4)`` yields resolutions 1°, 0.1°, 0.01°, 0.001° and
+        0.0001°.
+    window_bins : int, optional
+        The number of coarse bins on either side of the current best
+        estimate to search when refining.  For example, with
+        ``window_bins=3`` the algorithm evaluates shifts across a window
+        spanning ``±3`` bins at the coarse level, which expands to
+        ``±30`` bins at the next finer level.
+
+    Returns
+    -------
+    float
+        The rotation angle (in degrees) that best aligns ``img_a`` to
+        ``img_b`` according to the orientation histograms.
+    """
+    # Initialize best shift and previous exponent
+    best_shift = 0
+    prev_exp = exponents[0]
+    for idx, exp in enumerate(exponents):
+        delta = 10.0 ** float(-exp)
+        # Compute histograms at this resolution
+        hist_a = _gradient_histogram(img_a, mask_a, delta, grad_threshold)
+        hist_b = _gradient_histogram(img_b, mask_b, delta, grad_threshold)
+        bins = len(hist_a)
+        if idx == 0:
+            # At the coarsest level, search across all possible shifts
+            search_indices = range(bins)
+        else:
+            # Determine how many fine bins correspond to one coarse bin
+            # Example: going from exp=0 (delta=1) to exp=1 (delta=0.1)
+            factor = int(round(10 ** (exp - prev_exp)))
+            # Convert the previous best shift to the current resolution
+            center = best_shift * factor
+            # Build a list of candidate shifts within the search window
+            # The search window width is scaled by factor
+            offsets = range(-window_bins * factor, window_bins * factor + 1)
+            search_indices = [(center + off) % bins for off in offsets]
+        # Find the best shift within the candidate indices
+        min_err = None
+        min_idx = 0
+        # Precompute a copy of hist_a to avoid reindexing inside the loop
+        # We'll compare against shifted versions of hist_b
+        for sidx in search_indices:
+            shifted_b = np.roll(hist_b, sidx)
+            err = float(np.sum(np.abs(hist_a - shifted_b)))
+            if (min_err is None) or (err < min_err):
+                min_err = err
+                min_idx = sidx
+        # Update best shift and previous exponent for the next iteration
+        best_shift = min_idx
+        prev_exp = exp
+    # Compute the final delta corresponding to the finest exponent
+    delta_final = 10.0 ** float(-exponents[-1])
+    return best_shift * delta_final
+
+
+class AlignImagesAutoRefineNode:
+    """Align images using a multi‑resolution search to refine the rotation angle."""
+
+    CATEGORY = "image/transform"
+
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Dict[str, Any]]:
+        """
+        Define the input types for the auto‑refining alignment node.
+
+        Only a gradient threshold is exposed to the user.  The search
+        resolutions are fixed internally to progress through 1°, 0.1°,
+        0.01°, 0.001° and 0.0001°.
+        """
+        return {
+            "required": {
+                "image_a": ("IMAGE",),
+                "mask_a": ("MASK",),
+                "image_b": ("IMAGE",),
+                "mask_b": ("MASK",),
+                # Gradient magnitude threshold (relative) between 0.04 and 0.1
+                "grad_threshold": (
+                    "FLOAT",
+                    {
+                        "default": 0.04,
+                        "min": 0.04,
+                        "max": 0.1,
+                        "step": 0.01,
+                        "display": "slider",
+                    },
+                ),
+                # Optional search window size (coarse bins).  Larger values
+                # increase accuracy at the cost of more comparisons.
+                "window_bins": (
+                    "INT",
+                    {
+                        "default": 3,
+                        "min": 1,
+                        "max": 10,
+                        "step": 1,
+                        "display": "slider",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES: Tuple[str, ...] = ("IMAGE", "MASK", "FLOAT")
+
+    FUNCTION: str = "align_images_auto"
+
+    @staticmethod
+    def align_images_auto(
+        image_a: "torch.Tensor",
+        mask_a: "torch.Tensor",
+        image_b: "torch.Tensor",
+        mask_b: "torch.Tensor",
+        grad_threshold: float = 0.04,
+        window_bins: int = 3,
+    ) -> Tuple["torch.Tensor", "torch.Tensor", Any]:
+        """
+        Align a batch of images using the multi‑resolution angle search.
+
+        Parameters
+        ----------
+        image_a : torch.Tensor
+            Batch of source images of shape ``[B, H, W, C]``.
+        mask_a : torch.Tensor
+            Batch of source masks of shape ``[B, H, W]``.
+        image_b : torch.Tensor
+            Batch of target images of shape ``[B, H, W, C]``.
+        mask_b : torch.Tensor
+            Batch of target masks of shape ``[B, H, W]``.
+        grad_threshold : float
+            Relative gradient magnitude threshold for histogram construction.
+        window_bins : int
+            Number of coarse bins on either side of the current best shift
+            to search when refining.  A value of 3 is usually sufficient.
+
+        Returns
+        -------
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            The aligned images, the unchanged target masks and the
+            rotation angles (one per batch element).
+        """
+        if torch is None:
+            raise RuntimeError("PyTorch is required for this custom node but was not imported.")
+        if cv2 is None:
+            raise RuntimeError("OpenCV is required for this custom node but was not imported.")
+
+        B = image_a.shape[0]
+        aligned_images: List["torch.Tensor"] = []
+        out_masks: List["torch.Tensor"] = []
+        angles: List[float] = []
+        for idx in range(B):
+            img_a_np = image_a[idx].detach().cpu().numpy()
+            msk_a_np = mask_a[idx].detach().cpu().numpy()
+            img_b_np = image_b[idx].detach().cpu().numpy()
+            msk_b_np = mask_b[idx].detach().cpu().numpy()
+            # Determine the rotation angle using the progressive search
+            angle = _find_angle_auto_refine(
+                img_a_np,
+                msk_a_np,
+                img_b_np,
+                msk_b_np,
+                grad_threshold=grad_threshold,
+                exponents=(0, 1, 2, 3, 4),
+                window_bins=window_bins,
+            )
+            # Compose and convert back to torch
+            composed_np, out_msk_np = _rotate_and_compose(
+                img_a_np,
+                msk_a_np,
+                img_b_np,
+                msk_b_np,
+                angle,
+            )
+            aligned_images.append(torch.from_numpy(composed_np).to(image_a.dtype))
+            out_masks.append(torch.from_numpy(out_msk_np).to(mask_b.dtype))
+            angles.append(float(angle))
+        out_images = torch.stack(aligned_images, dim=0)
+        out_masks_tensor = torch.stack(out_masks, dim=0)
+        angles_tensor = torch.tensor(angles, dtype=torch.float32)
+        return out_images, out_masks_tensor, angles_tensor
+
+
+# Register the auto‑refine node alongside the original alignment node
+NODE_CLASS_MAPPINGS.update({
+    "AlignImagesAutoRefineNode": AlignImagesAutoRefineNode,
+})
+
+NODE_DISPLAY_NAME_MAPPINGS.update({
+    "AlignImagesAutoRefineNode": "Align Images (Auto Refine)",
+})
