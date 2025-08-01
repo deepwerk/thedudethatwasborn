@@ -252,6 +252,9 @@ class AlignAndOverlay:
             # Rotate without reshape so that the mask sizes match B
             rot = nd_rotate(image_A, angle=cand, reshape=False, order=1, mode="constant", cval=0.0)
             mask_rot = np.any(rot > eps, axis=2)
+            # Resize mask_rot to match mask_B if needed
+            if mask_rot.shape != mask_B.shape:
+                mask_rot = cv2.resize(mask_rot.astype(np.uint8), (mask_B.shape[1], mask_B.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
             # Score: count of differing pixels between masks
             score = np.count_nonzero(mask_rot != mask_B)
             if best_score is None or score < best_score:
@@ -399,13 +402,13 @@ class AlignAndOverlay:
         # Validate inputs
         if images_A.dim() != 4 or images_B.dim() != 4:
             raise ValueError("Input images must be 4‑D tensors with shape [B,H,W,C]")
-        if images_A.shape != images_B.shape:
+        if images_A.shape[0] != images_B.shape[0]:
             raise ValueError(
-                f"Shape mismatch between images_A {images_A.shape} and images_B {images_B.shape}"
+                f"Batch size mismatch: images_A batch {images_A.shape[0]} vs images_B batch {images_B.shape[0]}"
             )
-        batch_size, height, width, channels = images_A.shape
-        if channels != 3:
+        if images_A.shape[-1] != 3 or images_B.shape[-1] != 3:
             raise ValueError("Images must have 3 channels (RGB)")
+        batch_size = images_A.shape[0]
 
         # Prepare lists to collect outputs for each item in the batch
         out_images: list[torch.Tensor] = []
